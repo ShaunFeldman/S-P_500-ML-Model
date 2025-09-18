@@ -34,6 +34,3 @@ df = yf.download(tickers=symbols_list,
 df.index.names = ['date', 'ticker']
 
 df.columns = df.columns.str.lower()
-
-
-print(df)
