@@ -1,16 +1,19 @@
-from statsmodels.regression.rolling import RollingOLS
-import pandas_datareader.data as web
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import statsmodels.api as sm
 import pandas as pd
 import numpy as np
-import datetime as dt
 import yfinance as yf
 import pandas_ta
 import lightgbm as lgb
 import warnings
 warnings.filterwarnings('ignore')
+
+try:
+    from hmmlearn.hmm import GaussianHMM
+    HMM_AVAILABLE = True
+except Exception:
+    HMM_AVAILABLE = False
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -24,6 +27,11 @@ TRAIN_WARMUP  = 24      # months of history before first prediction
 RETRAIN_FREQ  = 3       # retrain every N months (1 = monthly, 3 = quarterly)
 TC_ONE_WAY    = 0.0010  # 10bps one-way transaction cost (conservative for large caps)
 RF_ANNUAL     = 0.04    # risk-free rate for Sharpe / Sortino
+
+USE_PIT_UNIVERSE = True  # build approximate point-in-time membership from Wiki change log
+USE_HMM_FILTER   = True  # risk regime filter on/off
+HMM_STATES       = 3
+HMM_MIN_OBS      = 36
 
 LGB_PARAMS = {
     'objective':         'regression',
@@ -46,11 +54,87 @@ LGB_PARAMS = {
 # 1. DATA COLLECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
+def norm_ticker(x):
+    if pd.isna(x):
+        return np.nan
+    return str(x).strip().upper().replace('.', '-')
+
+def get_wiki_tables():
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    return pd.read_html(url, storage_options={"User-Agent": "Mozilla/5.0"})
+
+def find_col(df, candidates):
+    lower_map = {}
+    for c in df.columns:
+        if isinstance(c, tuple):
+            key = " ".join([str(part).strip().lower() for part in c if str(part) != 'nan'])
+        else:
+            key = str(c).strip().lower()
+        lower_map[key] = c
+
+    for c in candidates:
+        c = c.strip().lower()
+        for k, v in lower_map.items():
+            if c == k or c in k:
+                return v
+    return None
+
+def build_constituent_map(tables, monthly_dates):
+    # Table 0 is the current constituents. We use table 1 (historical changes)
+    # to approximately reconstruct monthly point-in-time members.
+    current = tables[0].copy()
+    current['Symbol'] = current['Symbol'].map(norm_ticker)
+    curr_set = set(current['Symbol'].dropna())
+
+    if len(tables) < 2:
+        return {d: curr_set.copy() for d in monthly_dates}
+
+    changes = tables[1].copy()
+    date_col = find_col(changes, ['date'])
+    add_col = find_col(changes, ['added ticker', 'added'])
+    rem_col = find_col(changes, ['removed ticker', 'removed'])
+    if date_col is None or (add_col is None and rem_col is None):
+        return {d: curr_set.copy() for d in monthly_dates}
+
+    # Wikipedia tables occasionally arrive with MultiIndex columns, so we avoid
+    # depending on a newly-added label existing in `changes.columns`.
+    change_date = pd.to_datetime(changes[date_col], errors='coerce')
+    if add_col is not None:
+        added_ticker = changes[add_col].map(norm_ticker)
+    else:
+        added_ticker = pd.Series(np.nan, index=changes.index)
+    if rem_col is not None:
+        removed_ticker = changes[rem_col].map(norm_ticker)
+    else:
+        removed_ticker = pd.Series(np.nan, index=changes.index)
+
+    valid = change_date.notna()
+    changes = pd.DataFrame({
+        'change_date': change_date[valid],
+        'added_ticker': added_ticker[valid],
+        'removed_ticker': removed_ticker[valid],
+    }).sort_values('change_date', ascending=False)
+
+    by_month = {}
+    idx = 0
+    for d in sorted(monthly_dates, reverse=True):
+        while idx < len(changes) and changes.iloc[idx]['change_date'] > d:
+            row = changes.iloc[idx]
+            add_t = row['added_ticker']
+            rem_t = row['removed_ticker']
+            # Reverse current-day change to roll universe backward in time.
+            if isinstance(add_t, str) and add_t and add_t in curr_set:
+                curr_set.remove(add_t)
+            if isinstance(rem_t, str) and rem_t:
+                curr_set.add(rem_t)
+            idx += 1
+        by_month[d] = curr_set.copy()
+    return by_month
+
 print("Fetching S&P 500 constituents...")
-url    = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-tables = pd.read_html(url, storage_options={"User-Agent": "Mozilla/5.0"})
+tables = get_wiki_tables()
 sp500  = tables[0]
-sp500['Symbol'] = sp500['Symbol'].str.replace('.', '-')
+sp500['Symbol'] = sp500['Symbol'].map(norm_ticker)
 symbols_list    = sp500['Symbol'].unique().tolist()
 
 print(f"Downloading {len(symbols_list)} tickers from {START_DATE.date()} to {END_DATE}...")
@@ -58,13 +142,13 @@ df = yf.download(
     tickers=symbols_list,
     start=START_DATE,
     end=END_DATE,
-    auto_adjust=False,
+    auto_adjust=True,
     progress=False,
 ).stack()
 df.index.names = ['date', 'ticker']
 df.columns     = df.columns.str.lower()
-if 'adj close' not in df.columns and 'close' in df.columns:
-    df['adj close'] = df['close']
+if 'close' not in df.columns:
+    raise RuntimeError("Missing close prices from yfinance download.")
 print(f"Downloaded {len(df):,} daily observations across {df.index.get_level_values('ticker').nunique()} tickers.\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -77,20 +161,20 @@ print("Computing daily technical indicators...")
 # incorporates the full O/H/L/C price path. A staple in systematic strategies.
 df['garman_klass_vol'] = (
     (np.log(df['high']) - np.log(df['low']))**2 / 2
-    - (2 * np.log(2) - 1) * (np.log(df['adj close']) - np.log(df['open']))**2
+    - (2 * np.log(2) - 1) * (np.log(df['close']) - np.log(df['open']))**2
 )
 
-df['rsi'] = df.groupby(level=1)['adj close'].transform(
+df['rsi'] = df.groupby(level=1)['close'].transform(
     lambda x: pandas_ta.rsi(close=x, length=20)
 )
 
-df['bb_low'] = df.groupby(level=1)['adj close'].transform(
+df['bb_low'] = df.groupby(level=1)['close'].transform(
     lambda x: pandas_ta.bbands(close=np.log1p(x), length=20).iloc[:, 0]
 )
-df['bb_mid'] = df.groupby(level=1)['adj close'].transform(
+df['bb_mid'] = df.groupby(level=1)['close'].transform(
     lambda x: pandas_ta.bbands(close=np.log1p(x), length=20).iloc[:, 1]
 )
-df['bb_high'] = df.groupby(level=1)['adj close'].transform(
+df['bb_high'] = df.groupby(level=1)['close'].transform(
     lambda x: pandas_ta.bbands(close=np.log1p(x), length=20).iloc[:, 2]
 )
 
@@ -106,8 +190,8 @@ def compute_macd(close):
     return macd.sub(macd.mean()).div(macd.std())
 
 df['atr']          = df.groupby(level=1, group_keys=False).apply(compute_atr)
-df['macd']         = df.groupby(level=1, group_keys=False)['adj close'].apply(compute_macd)
-df['dollar_volume'] = (df['adj close'] * df['volume']) / 1e6
+df['macd']         = df.groupby(level=1, group_keys=False)['close'].apply(compute_macd)
+df['dollar_volume'] = (df['close'] * df['volume']) / 1e6
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. MONTHLY AGGREGATION
@@ -118,7 +202,7 @@ print("Aggregating to monthly frequency...")
 # Take the last available trading day of each calendar month for indicator
 # values. Use mean dollar volume — a better liquidity estimate than point-in-time.
 indicator_cols = [
-    'adj close', 'garman_klass_vol', 'rsi',
+    'close', 'garman_klass_vol', 'rsi',
     'bb_low', 'bb_mid', 'bb_high', 'atr', 'macd'
 ]
 
@@ -137,6 +221,19 @@ monthly['dollar_volume'] = safe_stack(
 ).squeeze()
 
 monthly.index.names = ['date', 'ticker']
+
+if USE_PIT_UNIVERSE:
+    monthly_dates = monthly.index.get_level_values('date').unique().tolist()
+    pit_members = build_constituent_map(tables, monthly_dates)
+    membership = pd.Series(
+        [
+            idx_ticker in pit_members.get(idx_date, set())
+            for idx_date, idx_ticker in monthly.index
+        ],
+        index=monthly.index
+    )
+    monthly = monthly[membership]
+    print("Applied approximate point-in-time S&P 500 membership from Wiki change log.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. LIQUIDITY FILTER
@@ -160,14 +257,14 @@ print(f"Liquid universe: ~{N_LIQUID} stocks/month | "
 
 # Monthly simple returns from adjusted close.
 monthly['monthly_return'] = (
-    monthly.groupby(level='ticker')['adj close'].pct_change()
+    monthly.groupby(level='ticker')['close'].pct_change()
 )
 
 # Multi-horizon momentum: trailing returns capture both short-term momentum
 # and long-term mean reversion dynamics.
 for n in [1, 2, 3, 6, 9, 12]:
     monthly[f'ret_{n}m'] = (
-        monthly.groupby(level='ticker')['adj close'].pct_change(n)
+        monthly.groupby(level='ticker')['close'].pct_change(n)
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -332,6 +429,41 @@ print("\nWalk-forward complete.\n")
 # 10. PORTFOLIO CONSTRUCTION
 # ══════════════════════════════════════════════════════════════════════════════
 
+def hmm_exposure_filter(benchmark, n_states=3, min_obs=36):
+    if (not USE_HMM_FILTER) or (not HMM_AVAILABLE):
+        if USE_HMM_FILTER and not HMM_AVAILABLE:
+            print("hmmlearn not installed; skipping HMM regime filter.")
+        return pd.Series(1.0, index=benchmark.index, name='hmm_exposure')
+
+    exposures = []
+    for i in range(len(benchmark)):
+        if i < min_obs:
+            exposures.append(1.0)
+            continue
+
+        hist = benchmark.iloc[:i + 1].dropna()
+        if len(hist) < min_obs:
+            exposures.append(1.0)
+            continue
+
+        obs = hist.values.reshape(-1, 1)
+        try:
+            model = GaussianHMM(
+                n_components=n_states,
+                covariance_type='full',
+                n_iter=300,
+                random_state=42
+            )
+            model.fit(obs)
+            states = model.predict(obs)
+            state_means = pd.Series(obs.ravel()).groupby(states).mean()
+            current_state = states[-1]
+            exposures.append(float(state_means.loc[current_state] > state_means.median()))
+        except Exception:
+            exposures.append(1.0)
+
+    return pd.Series(exposures, index=benchmark.index, name='hmm_exposure')
+
 # Sort stocks into quintiles by predicted return rank each month.
 # Long the top quintile (Q5 ≈ top 20% = ~30 stocks).
 # Equal weight within the quintile — simple and hard to beat in practice.
@@ -349,6 +481,10 @@ strategy_gross   = (
 # Align benchmark to strategy dates (drop any gaps)
 benchmark_returns = spy_monthly.reindex(strategy_gross.index).dropna()
 strategy_gross    = strategy_gross.reindex(benchmark_returns.index)
+hmm_exposure      = hmm_exposure_filter(
+    benchmark_returns, n_states=HMM_STATES, min_obs=HMM_MIN_OBS
+).reindex(strategy_gross.index).fillna(1.0)
+strategy_gross    = strategy_gross * hmm_exposure + (1 - hmm_exposure) * (RF_ANNUAL / 12)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 11. TRANSACTION COST ESTIMATION
@@ -357,24 +493,17 @@ strategy_gross    = strategy_gross.reindex(benchmark_returns.index)
 # Estimate monthly portfolio turnover: what fraction of holdings change each month?
 # Apply 10bps one-way (bid-ask) cost — conservative for S&P 500 large caps.
 
-top_q_tickers = (
-    pred_df[pred_df['quintile'] == 4]
-    .groupby(level='date')
-    .apply(lambda g: set(g.index.get_level_values('ticker')))
-)
+top_q = pred_df[pred_df['quintile'] == 4].copy()
+top_q['w_raw'] = top_q.groupby(level='date')['forward_return'].transform(lambda x: 1 / len(x))
+weights = top_q['w_raw'].unstack(level='ticker').reindex(strategy_gross.index).fillna(0.0)
+weights = weights.mul(hmm_exposure, axis=0)
 
-turnovers, prev = [], set()
-for curr in top_q_tickers.values:
-    if prev:
-        turnovers.append(len(curr - prev) / max(len(curr), len(prev), 1))
-    prev = curr
+turnover = weights.diff().abs().sum(axis=1).fillna(0.0) / 2.0
+tc_series = turnover * 2 * TC_ONE_WAY
+strategy_net = strategy_gross - tc_series
 
-avg_turnover   = np.mean(turnovers) if turnovers else 0.5
-tc_per_month   = avg_turnover * TC_ONE_WAY * 2   # round-trip
-strategy_net   = strategy_gross - tc_per_month
-
-print(f"Avg monthly turnover : {avg_turnover:.0%}")
-print(f"TC drag / month      : {tc_per_month * 10_000:.1f} bps\n")
+print(f"Avg monthly turnover : {turnover.mean():.0%}")
+print(f"Avg TC drag / month  : {tc_series.mean() * 10_000:.1f} bps\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 12. PERFORMANCE METRICS
@@ -445,6 +574,47 @@ print(perf.to_string())
 print(f"\nCAPM Alpha (annualized): {alpha:.1%}  (t = {t_alpha:.2f})")
 print(f"CAPM Beta:               {capm_beta:.2f}")
 print("═════════════════════════════════════════════════════════\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 12b. FAMA-FRENCH 5-FACTOR ALPHA
+# ══════════════════════════════════════════════════════════════════════════════
+# CAPM alpha only controls for market exposure. The Fama-French 5-factor model
+# additionally controls for size (SMB), value (HML), profitability (RMW), and
+# investment (CMA) — the standard academic benchmark for systematic strategies.
+# Alpha that survives FF5 is genuinely uncorrelated with known risk premia.
+
+try:
+    import pandas_datareader.data as web
+
+    ff5_raw = web.DataReader(
+        'F-F_Research_Data_5_Factors_2x3', 'famafrench',
+        start=strategy_gross.index[0], end=strategy_gross.index[-1]
+    )[0] / 100  # convert from percent to decimal
+
+    ff5_raw.index = ff5_raw.index.to_timestamp('M')
+    ff5_aligned   = ff5_raw.reindex(strategy_gross.index).dropna()
+    port_excess   = strategy_gross.reindex(ff5_aligned.index) - ff5_aligned['RF']
+
+    X_ff5      = sm.add_constant(ff5_aligned[['Mkt-RF', 'SMB', 'HML', 'RMW', 'CMA']])
+    ff5_result = sm.OLS(port_excess, X_ff5).fit(cov_type='HAC', cov_kwds={'maxlags': 3})
+
+    ff5_alpha_ann = ff5_result.params['const'] * 12
+    ff5_alpha_t   = ff5_result.tvalues['const']
+    ff5_r2        = ff5_result.rsquared
+
+    print("══════════ FAMA-FRENCH 5-FACTOR REGRESSION ══════════════")
+    print(f"  Alpha (annualized) : {ff5_alpha_ann:.2%}  (t = {ff5_alpha_t:.2f})")
+    print(f"  R²                 : {ff5_r2:.3f}")
+    print(f"  Factor loadings:")
+    for f in ['Mkt-RF', 'SMB', 'HML', 'RMW', 'CMA']:
+        print(f"    {f:8s}  β = {ff5_result.params[f]:+.3f}  "
+              f"(t = {ff5_result.tvalues[f]:+.2f})")
+    print("═════════════════════════════════════════════════════════\n")
+
+except Exception as e:
+    print(f"FF5 alpha unavailable: {e}\n")
+    ff5_alpha_ann = np.nan
+    ff5_alpha_t   = np.nan
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 13. QUINTILE MONOTONICITY CHECK
