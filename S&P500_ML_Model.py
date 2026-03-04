@@ -23,15 +23,19 @@ except Exception:
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-END_DATE   = '2025-09-15'
+END_DATE   = '2026-03-3'
 START_DATE = pd.to_datetime(END_DATE) - pd.DateOffset(365 * 8)
 
-N_LIQUID     = 150     # top N stocks by dollar volume to trade each month
+N_LIQUID_US  = 120     # top N US stocks by dollar volume each month
+N_LIQUID_CA  = 30      # top N Canadian stocks by dollar volume each month
+N_LIQUID     = N_LIQUID_US + N_LIQUID_CA   # total universe size
 TRAIN_WARMUP = 24      # months of history before first prediction
 RETRAIN_FREQ = 1       # retrain every N months (1 = monthly, 3 = quarterly)
-TC_ONE_WAY   = 0.0010  # 10bps one-way transaction cost (conservative for large caps)
+TC_ONE_WAY   = 0.0010  # 10bps one-way transaction cost
 RF_ANNUAL    = 0.04    # risk-free rate for Sharpe / Sortino
 RF_MONTHLY   = RF_ANNUAL / 12
+
+UNIVERSE_MARKETS = ['US', 'CA']   # 'US' = S&P 500,  'CA' = TSX 60
 
 USE_PIT_UNIVERSE = True   # approximate point-in-time S&P 500 membership
 USE_HMM_FILTER   = True   # risk-off during bear regime
@@ -39,22 +43,35 @@ HMM_STATES       = 3
 HMM_MIN_OBS      = 36
 
 # ─── Portfolio optimizer settings ─────────────────────────────────────────────
-OPTIMIZE_PORTFOLIO = True   # use Ledoit-Wolf + max-Sharpe for live portfolio
+OPTIMIZE_PORTFOLIO = True   # Ledoit-Wolf + max-Sharpe for live portfolio
 MAX_POSITION_SIZE  = 0.10   # max single-stock weight (10%)
 MIN_POSITION_SIZE  = 0.00   # long-only
 
+# ─── ETFs: risk metrics only — excluded from model training ───────────────────
+PORTFOLIO_ETFS = {'VFV.TO', 'XEF.TO', 'XIC.TO', 'XEQT.TO', 'SPY', 'QQQ', 'VOO'}
+
 # ─── YOUR CURRENT PORTFOLIO ───────────────────────────────────────────────────
-# Enter ticker → weight (or dollar amount — it gets normalized to weights).
-# The model will score every holding, compute VaR/CVaR/beta, flag weak
-# positions, and suggest additions from the top factor signals.
+# Enter ticker → weight or dollar amount (normalized automatically).
+# Canadian stocks: use .TO suffix  (e.g. "RY.TO").
+# ETFs: VaR/CVaR/beta computed; model score shown as "N/A (ETF)".
 # Set MY_PORTFOLIO = {} to skip personal portfolio analysis.
 MY_PORTFOLIO = {
-    # "AAPL": 0.20,
-    # "MSFT": 0.15,
-    # "NVDA": 0.10,
-    # "AMZN": 0.10,
-    # "GOOGL": 0.10,
-    # "TSLA": 0.05,
+    # US stocks (S&P 500)
+    "GOOGL":    1391,
+    "MU":        932,
+    "MSFT":      348,
+    "NVDA":      460,
+
+    # Canadian stocks (TSX) — values already converted to USD at ~0.70
+    "RY.TO":    1222,   # Royal Bank of Canada
+    "BMO.TO":   1096,   # Bank of Montreal
+    "TD.TO":     996,   # TD Bank
+
+    # Canadian ETFs — risk metrics only, no model score
+    "XEQT.TO":  3155,   # iShares Core Equity ETF Portfolio (global)
+    "VFV.TO":    909,   # Vanguard S&P 500 ETF (CAD)
+    "XEF.TO":    557,   # iShares MSCI EAFE (international developed)
+    "XIC.TO":    428,   # iShares S&P/TSX Composite (Canadian market)
 }
 
 LGB_PARAMS = {
@@ -143,11 +160,57 @@ def build_constituent_map(tables, monthly_dates):
         by_month[d] = curr_set.copy()
     return by_month
 
+def get_tsx60_tickers():
+    """
+    Return TSX 60 constituent tickers in yfinance format (with .TO suffix).
+    Tries Wikipedia first; falls back to a hardcoded list if scraping fails.
+    """
+    # Hardcoded TSX 60 (yfinance format, accurate as of 2025)
+    TSX60_FALLBACK = [
+        'AEM.TO', 'ATD.TO', 'BAM.TO', 'BCE.TO', 'BMO.TO', 'BN.TO', 'BNS.TO',
+        'CAE.TO', 'CCL-B.TO', 'CM.TO', 'CNQ.TO', 'CNR.TO', 'CP.TO', 'CSU.TO',
+        'CVE.TO', 'DOL.TO', 'ENB.TO', 'EQB.TO', 'FM.TO', 'FNV.TO', 'GIB-A.TO',
+        'GWO.TO', 'H.TO', 'IFC.TO', 'IMO.TO', 'KEY.TO', 'L.TO', 'MFC.TO',
+        'MG.TO', 'MRU.TO', 'NA.TO', 'NTR.TO', 'OVV.TO', 'POW.TO', 'PPL.TO',
+        'QBR-B.TO', 'RCI-B.TO', 'RY.TO', 'SAP.TO', 'SLF.TO', 'SU.TO',
+        'T.TO', 'TD.TO', 'TIH.TO', 'TRP.TO', 'WCN.TO', 'WN.TO', 'WSP.TO', 'X.TO',
+    ]
+    try:
+        tbls = pd.read_html(
+            "https://en.wikipedia.org/wiki/S%26P/TSX_60",
+            storage_options={"User-Agent": "Mozilla/5.0"}
+        )
+        for t in tbls:
+            sym_col = find_col(t, ['ticker symbol', 'ticker', 'symbol'])
+            if sym_col is not None:
+                raw = t[sym_col].dropna().astype(str).str.strip().str.upper()
+                tickers = []
+                for s in raw:
+                    s = s.replace('.', '-')        # AGF.B → AGF-B (yfinance format)
+                    if 1 <= len(s) <= 8 and s.replace('-', '').isalpha():
+                        tickers.append(s + '.TO')
+                if len(tickers) >= 30:
+                    print(f"  Fetched {len(tickers)} TSX 60 tickers from Wikipedia.")
+                    return tickers
+    except Exception as e:
+        print(f"  TSX 60 Wikipedia fetch failed ({e}), using hardcoded list.")
+    return TSX60_FALLBACK
+
+
 print("Fetching S&P 500 constituents...")
 tables       = get_wiki_tables()
 sp500        = tables[0]
 sp500['Symbol'] = sp500['Symbol'].map(norm_ticker)
-symbols_list = sp500['Symbol'].unique().tolist()
+us_symbols   = sp500['Symbol'].unique().tolist()
+
+ca_symbols = []
+if 'CA' in UNIVERSE_MARKETS:
+    print("Fetching TSX 60 constituents...")
+    ca_symbols = get_tsx60_tickers()
+    print(f"  {len(ca_symbols)} Canadian tickers added to universe.")
+
+ca_tickers_set = set(ca_symbols)
+symbols_list   = us_symbols + ca_symbols
 
 print(f"Downloading {len(symbols_list)} tickers from {START_DATE.date()} to {END_DATE}...")
 df = yf.download(
@@ -162,7 +225,27 @@ df.columns     = df.columns.str.lower()
 if 'close' not in df.columns:
     raise RuntimeError("Missing close prices from yfinance download.")
 print(f"Downloaded {len(df):,} daily observations across "
-      f"{df.index.get_level_values('ticker').nunique()} tickers.\n")
+      f"{df.index.get_level_values('ticker').nunique()} tickers.")
+
+# ── FX: Convert Canadian stocks from CAD → USD ────────────────────────────────
+# All prices are converted to USD before any feature computation.
+# This means momentum, dollar volume, and returns all reflect USD-equivalent values,
+# so Canadian and US stocks are directly comparable in the cross-sectional model.
+fx_daily = None
+ca_in_df = [t for t in ca_tickers_set if t in df.index.get_level_values('ticker').unique()]
+if ca_in_df:
+    print("Downloading CAD/USD FX rate for currency normalization...")
+    fx_raw   = yf.download('CADUSD=X', start=START_DATE, end=END_DATE,
+                            auto_adjust=False, progress=False)
+    fx_daily = fx_raw['Close'].squeeze().rename('cadusd').ffill().bfill()
+    ca_mask  = df.index.get_level_values('ticker').isin(ca_in_df)
+    fx_vals  = fx_daily.reindex(df.index.get_level_values('date')).values
+    for col in ['close', 'open', 'high', 'low']:
+        if col in df.columns:
+            df.loc[ca_mask, col] = df.loc[ca_mask, col].values * fx_vals[ca_mask]
+    print(f"  CAD→USD applied to {len(ca_in_df)} Canadian tickers.\n")
+else:
+    print()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. DAILY TECHNICAL INDICATORS
@@ -235,23 +318,29 @@ if USE_PIT_UNIVERSE:
     monthly_dates = monthly.index.get_level_values('date').unique().tolist()
     pit_members   = build_constituent_map(tables, monthly_dates)
     membership    = pd.Series(
-        [idx_ticker in pit_members.get(idx_date, set())
-         for idx_date, idx_ticker in monthly.index],
+        [
+            idx_ticker.endswith('.TO')                           # CA: always included
+            or idx_ticker in pit_members.get(idx_date, set())   # US: PIT filter
+            for idx_date, idx_ticker in monthly.index
+        ],
         index=monthly.index
     )
     monthly = monthly[membership]
-    print("Applied approximate point-in-time S&P 500 membership.")
+    print("Applied PIT membership: S&P 500 history (US) + full TSX 60 (CA).")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. LIQUIDITY FILTER
 # ══════════════════════════════════════════════════════════════════════════════
 
-monthly = (
-    monthly
-    .groupby(level='date', group_keys=False)
-    .apply(lambda g: g.nlargest(N_LIQUID, 'dollar_volume'))
-)
-print(f"Liquid universe: ~{N_LIQUID} stocks/month | "
+def _liquidity_filter(g):
+    """Per-market liquidity quota: top N_LIQUID_US (US) + top N_LIQUID_CA (CA)."""
+    ca_mask = g.index.get_level_values('ticker').str.endswith('.TO')
+    top_us  = g[~ca_mask].nlargest(N_LIQUID_US, 'dollar_volume')
+    top_ca  = g[ca_mask].nlargest(N_LIQUID_CA, 'dollar_volume')
+    return pd.concat([top_us, top_ca])
+
+monthly = monthly.groupby(level='date', group_keys=False).apply(_liquidity_filter)
+print(f"Liquid universe: ~{N_LIQUID} stocks/month (≤{N_LIQUID_US} US + ≤{N_LIQUID_CA} CA) | "
       f"{monthly.index.get_level_values('date').nunique()} months of data.\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -706,7 +795,9 @@ if MY_PORTFOLIO:
     # Score each holding
     rows_p = []
     for ticker, w in sorted(my_w.items(), key=lambda x: -x[1]):
-        if ticker in last_preds.index:
+        if ticker in PORTFOLIO_ETFS:
+            score, q_num, signal = np.nan, None, "N/A (ETF)"
+        elif ticker in last_preds.index:
             score    = last_preds.loc[ticker, 'predicted_rank']
             q_num    = int(last_preds.loc[ticker, 'quintile']) + 1
             signal   = "↑ HOLD/ADD" if q_num == 5 else ("↓ TRIM" if q_num <= 2 else "→ NEUTRAL")
@@ -727,6 +818,33 @@ if MY_PORTFOLIO:
               f"{row['Quintile']:>5}  {row['Signal']}")
 
     # Portfolio risk metrics
+    # Download any tickers missing from the training universe (ETFs, non-S&P 500/TSX 60)
+    missing = [t for t in my_w if t not in all_returns.columns]
+    if missing:
+        print(f"\n  Fetching data for missing tickers: {', '.join(missing)} ...")
+        try:
+            extra_raw = yf.download(missing, start=START_DATE, end=END_DATE,
+                                    auto_adjust=True, progress=False)
+            if isinstance(extra_raw.columns, pd.MultiIndex):
+                extra_close = extra_raw['Close']
+            else:
+                extra_close = pd.DataFrame(extra_raw['Close'])
+                extra_close.columns = [missing[0]] if len(missing) == 1 else missing
+            extra_monthly = extra_close.resample('ME').last().pct_change()
+            # FX: convert any .TO tickers from CAD returns to USD returns
+            if fx_daily is not None:
+                fx_monthly_ret = fx_daily.resample('ME').last().pct_change()
+                for col in extra_monthly.columns:
+                    t = col if isinstance(col, str) else col[0]
+                    if t.endswith('.TO'):
+                        fx_r = fx_monthly_ret.reindex(extra_monthly.index)
+                        extra_monthly[col] = (1 + extra_monthly[col]) * (1 + fx_r) - 1
+            for col in extra_monthly.columns:
+                t = col if isinstance(col, str) else col[0]
+                all_returns[t] = extra_monthly[col]
+        except Exception as e:
+            print(f"  Could not download missing tickers: {e}")
+
     user_tickers = [t for t in my_w if t in all_returns.columns]
     if user_tickers:
         w_arr     = np.array([my_w[t] for t in user_tickers])
@@ -790,7 +908,7 @@ if MY_PORTFOLIO:
 n_panels = 4 if MY_PORTFOLIO and user_tickers else 3
 fig, axes = plt.subplots(n_panels, 1, figsize=(14, 6 * n_panels))
 fig.suptitle(
-    'S&P 500 Factor ML Portfolio — Performance Tearsheet',
+    'Multi-Market Factor ML Portfolio (S&P 500 + TSX 60) — Performance Tearsheet',
     fontsize=15, fontweight='bold', y=0.99
 )
 
